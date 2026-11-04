@@ -1,0 +1,7 @@
+services:
+  pdfcraft-web:
+    image: ghcr.io/mikapst/pdfcraft-web:latest
+    container_name: pdfcraft-web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
