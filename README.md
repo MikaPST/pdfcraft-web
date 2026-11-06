@@ -3,21 +3,25 @@
 </p>
 
 <h1 align="center">PdfCraft Web — Docker Image</h1>
-
 <p align="center">
   A community-maintained Docker image for
   <a href="https://github.com/storytold/pdfcraft">PdfCraft</a>,
   bringing its WebAssembly-based PDF reader and editor to a self-hosted web interface.
   <br>
-  Automated weekly builds and image publication to GitHub Container Registry (GHCR).
+  Build automation and image publication to GitHub Container Registry (GHCR).
 </p>
-
 <p align="center">
   <a href="https://github.com/MikaPST/pdfcraft-web/actions/workflows/publish-image.yml">
     <img src="https://github.com/MikaPST/pdfcraft-web/actions/workflows/publish-image.yml/badge.svg" alt="Build and publish PdfCraft Web">
   </a>
-  <a href="https://ghcr.io/mikapst/pdfcraft-web">
+  <a href="https://github.com/MikaPST/pdfcraft-web/releases/latest">
+    <img src="https://img.shields.io/github/v/release/MikaPST/pdfcraft-web?label=Release&logo=github&color=blue" alt="Latest Release">
+  </a>
+  <a href="https://github.com/MikaPST/pdfcraft-web/pkgs/container/pdfcraft-web">
     <img src="https://ghcr-badge.egpl.dev/mikapst/pdfcraft-web/latest_tag?trim=major&label=GHCR" alt="GHCR image tag">
+  </a>
+  <a href="docker-compose.yml">
+    <img src="https://img.shields.io/badge/Docker%20Compose-ready-2496ED?logo=docker&logoColor=white" alt="Docker Compose configuration">
   </a>
 </p>
 
@@ -29,10 +33,11 @@ The upstream PdfCraft project provides a WebAssembly build that can be served as
 
 The goals are to:
 
-- Build the web app from the current `main` branch of [storytold/pdfcraft](https://github.com/storytold/pdfcraft).
+- Publish a matching GitHub Release only after the Docker build and push succeed.
+- Build the WebAssembly application from official release tags in [storytold/pdfcraft](https://github.com/storytold/pdfcraft).
 - Include the Japanese font assets from [storytold/craft-fonts](https://github.com/storytold/craft-fonts).
-- Rebuild the image automatically each week and publish it to GHCR.
-- Provide a simple image that can later be offered through Unraid Community Applications.
+- Check weekly for new official releases and publish a versioned image to GHCR.
+- Provide Docker deployment for Unraid Community Applications.
 - Keep this packaging project separate from the upstream PdfCraft source code.
 
 This is an independent community packaging project. It is **not an official PdfCraft release** and is not affiliated with or endorsed by the PdfCraft or ArtCraft maintainers.
@@ -55,6 +60,14 @@ The published image is:
 ```text
 ghcr.io/mikapst/pdfcraft-web:latest
 ```
+
+Each official upstream release is also published under its exact version tag, for example:
+
+```text
+ghcr.io/mikapst/pdfcraft-web:vX.Y.Z
+```
+
+Use a versioned tag if you want to keep a deployment on a specific release. The `latest` tag updates when an image is published.
 
 ### Quick start with Docker Compose
 
@@ -154,26 +167,33 @@ https://YOUR_DOMAIN/?webgl
 
 ## Automated builds
 
-GitHub Actions builds the PdfCraft web application and publishes the container image automatically.
+GitHub Actions checks the official [PdfCraft releases](https://github.com/storytold/pdfcraft/releases), builds the WebAssembly application from the selected upstream tag and publishes the image to GHCR.
 
 | Trigger | Behaviour |
 |---|---|
-| Weekly schedule | Checks out the current upstream `main` branch, builds the WebAssembly app and publishes a new image when the build succeeds |
-| Manual workflow dispatch | Allows a build to be started manually from the Actions tab |
-| Changes to packaging files | Runs the workflow when `docker-compose.yml`, `README.md` or the workflow file changes on `main` |
+| Weekly schedule | Checks the latest official PdfCraft release and builds it if it has not already been published here |
+| Manual workflow dispatch | Builds the latest official release, or a specified `upstream_tag` |
+| Force rebuild | Rebuilds an already published version with `force_rebuild: true` |
+| Changes to packaging files on `main` | Rebuilds the current official upstream release with the updated workflow |
 
 ### Published tags
 
-- `latest` — the latest successful build.
-- `upstream-<commit>` — identifies the exact PdfCraft source commit used for the build.
+- `latest` — the latest successfully published image (mutable tag).
+- `<upstream-version>` — the exact official upstream tag, for example `vX.Y.Z`.
+- `upstream-<commit>` — the upstream source commit used for the image (first 12 hexadecimal characters).
 
-The image is published for `linux/amd64` and `linux/arm64`. The container serves static web assets through NGINX; the generated web files are architecture-independent.
+The image targets both `linux/amd64` and `linux/arm64`. The workflow checks out **the official upstream release tag**, rather than compiling `main` as the versioned source.
 
-A scheduled rebuild does not guarantee that upstream changes are compatible or stable. If a build fails, the previous published image remains available.
+### GitHub Releases
 
-> **First-time GHCR setup:** after the first successful publication, check the package's visibility in GitHub Packages. Set `pdfcraft-web` to **Public** if you want users to pull the image without authenticating to GHCR.
+After a successful Docker build and GHCR push, the workflow creates or updates a [GitHub Release](https://github.com/MikaPST/pdfcraft-web/releases) matching the upstream tag. It includes the upstream release notes, source link and commit, Docker tags, supported architectures and (when available) the published image digest.
 
-## Build pipeline
+The Release badge at the top of this README updates automatically. Scheduled runs skip versions already released here. You can force a rebuild from **Actions → Build and publish PdfCraft Web → Run workflow**.
+
+> [!IMPORTANT]
+> A GitHub Release is created only after the Docker image has been successfully published. The `latest` tag may change after a rebuild; pin a versioned image tag for a stable deployment. Auxiliary source repositories (for example `craft-fonts`) may be checked out separately and are not necessarily pinned to the upstream release commit.
+
+### Build pipeline
 
 The workflow:
 
@@ -191,23 +211,28 @@ The upstream web build is based on the same Rust application code as the desktop
 
 ## Unraid Community Applications
 
-This image is intended to be usable on Unraid.
+This image can be deployed on Unraid.
 
-An Unraid Community Applications template will be added after the image build and runtime configuration have been tested and validated.
+The Unraid Community Applications template is maintained in [MikaPST/unraid-community-apps](https://github.com/MikaPST/unraid-community-apps), separately from this image-build repository.
 
 In the meantime, PdfCraft Web can be deployed on Unraid using the Docker Compose configuration above or by configuring the container manually with:
 
 - **Repository:** `ghcr.io/mikapst/pdfcraft-web:latest`
 - **Container port:** `8080`
 - **Host port:** `8080` by default
+- **Template:** [pdfcraft-web.xml](https://github.com/MikaPST/unraid-community-apps/blob/main/templates/pdfcraft-web.xml)
 
-## Upstream project and attribution
+## Upstream project
 
 - **PdfCraft source code:** [storytold/pdfcraft](https://github.com/storytold/pdfcraft)
 - **PdfCraft web hosting instructions:** [packaging/web/README.md](https://github.com/storytold/pdfcraft/blob/main/packaging/web/README.md)
 - **PdfCraft development notes:** [docs/development.md](https://github.com/storytold/pdfcraft/blob/main/docs/development.md)
 - **Shared font assets:** [storytold/craft-fonts](https://github.com/storytold/craft-fonts)
 - **Official releases:** [PdfCraft releases](https://github.com/storytold/pdfcraft/releases)
+
+The MikaPST GitHub Release tracks the upstream version but represents independent Docker packaging, not an official PdfCraft distribution.
+
+## License and attribution
 
 PdfCraft is dual-licensed under the MIT License or Apache License 2.0, at the user's option, as specified by the upstream project. Required notices are provided in the upstream `NOTICE` file. Bundled fonts, icons, images and other assets retain their own licenses and attribution requirements; consult upstream `ATTRIBUTION.md` and the `craft-fonts` repository.
 
