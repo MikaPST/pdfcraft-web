@@ -3,7 +3,7 @@ name: Build and publish PdfCraft Web
 on:
   schedule:
     # Weekly rebuild from upstream PdfCraft main (UTC).
-    - cron: "47 4 * * 1"
+    - cron: "47 3 * * *"
   workflow_dispatch:
     inputs:
       upstream_tag:
