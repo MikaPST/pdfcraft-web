@@ -1,32 +1,36 @@
 name: Build and publish PdfCraft Web
 
 on:
-  schedule:
-    # Weekly rebuild from upstream PdfCraft main (UTC).
-    - cron: "47 3 * * *"
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: "Official upstream release tag (empty = latest)"
+        description: "Official PdfCraft release tag (empty = latest)"
         required: false
         type: string
       force_rebuild:
-        description: "Rebuild an already published release"
+        description: "Rebuild even if the matching MikaPST GitHub Release exists"
         required: false
         default: false
         type: boolean
+  schedule:
+    # Daily at 03:47 UTC; a published release is skipped unless forced.
+    - cron: "47 3 * * *"
   push:
     branches:
       - main
     paths:
+      - ".github/workflows/publish-image.yml"
+      - "Dockerfile"
+      - "nginx.conf"
+      - ".dockerignore"
       - "docker-compose.yml"
       - "README.md"
-      - ".github/workflows/publish-image.yml"
 
 permissions:
   contents: write
   packages: write
 
+# Do not publish two revisions concurrently to the same mutable GHCR tags.
 concurrency:
   group: pdfcraft-web-publish
   cancel-in-progress: false
@@ -34,62 +38,90 @@ concurrency:
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
 
     steps:
-      - name: Check out packaging repository
+      # --------------------------------------------------
+      # 1. Checkout the versioned packaging repository.
+      # --------------------------------------------------
+      - name: Checkout packaging repository
         uses: actions/checkout@v4
+        with:
+          path: packaging
 
-      - name: Resolve official upstream release
-        id: upstream-release
+      - name: Validate packaging files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in Dockerfile nginx.conf .dockerignore docker-compose.yml README.md; do
+            test -s "packaging/$file" || { echo "::error::Missing packaging/$file"; exit 1; }
+          done
+
+      # --------------------------------------------------
+      # 2. Resolve the official upstream release/tag.
+      # --------------------------------------------------
+      - name: Resolve official PdfCraft release
+        id: release
         uses: actions/github-script@v7
         env:
           REQUESTED_TAG: ${{ inputs.upstream_tag }}
         with:
           script: |
-            const requested = (process.env.REQUESTED_TAG || '').trim();
+            const tag = (process.env.REQUESTED_TAG || '').trim();
             const args = { owner: 'storytold', repo: 'pdfcraft' };
-            const result = requested
-              ? await github.rest.repos.getReleaseByTag({ ...args, tag: requested })
+            const { data: release } = tag
+              ? await github.rest.repos.getReleaseByTag({ ...args, tag })
               : await github.rest.repos.getLatestRelease(args);
-            const release = result.data;
-            if (!release.tag_name) throw new Error('No upstream release tag found');
+            if (!release.tag_name) throw new Error('Upstream release has no tag');
             core.setOutput('tag', release.tag_name);
+            core.setOutput('name', release.name || `PdfCraft ${release.tag_name}`);
             core.setOutput('url', release.html_url);
-            core.setOutput('body', release.body || '');
             core.setOutput('prerelease', String(release.prerelease));
             core.setOutput('published_at', release.published_at || '');
-            core.setOutput('name', release.name || `pdfcraft ${release.tag_name}`);
 
-      - name: Check local release
-        id: release-check
+      # --------------------------------------------------
+      # 3. Skip a published version unless manually forced
+      #    or packaging files have been changed on main.
+      # --------------------------------------------------
+      - name: Check existing MikaPST release
+        id: check
         uses: actions/github-script@v7
         env:
-          TAG: ${{ steps.upstream-release.outputs.tag }}
+          UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
           FORCE_REBUILD: ${{ inputs.force_rebuild }}
         with:
           script: |
             let exists = false;
             try {
-              await github.rest.repos.getReleaseByTag({ ...context.repo, tag: process.env.TAG });
+              await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: process.env.UPSTREAM_TAG
+              });
               exists = true;
             } catch (error) {
               if (error.status !== 404) throw error;
             }
-            const forced = process.env.FORCE_REBUILD === 'true' || context.eventName === 'push';
-            core.setOutput('skip', String(exists && !forced));
+            const force = process.env.FORCE_REBUILD === 'true' || context.eventName === 'push';
+            const skip = exists && !force;
+            core.info(skip ? 'Already published: skipping build.' : 'Build required.');
+            core.setOutput('skip', String(skip));
 
-      - name: Check out PdfCraft source
-        if: steps.release-check.outputs.skip != 'true'
+      # --------------------------------------------------
+      # 4. Checkout the exact official PdfCraft release and
+      #    shared font assets (which follow their own main).
+      # --------------------------------------------------
+      - name: Checkout official PdfCraft source
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
           repository: storytold/pdfcraft
-          ref: ${{ steps.upstream-release.outputs.tag }}
+          ref: ${{ steps.release.outputs.tag }}
           path: upstream
           fetch-depth: 1
 
-      - name: Check out shared font assets
-        if: steps.release-check.outputs.skip != 'true'
+      - name: Checkout shared Craft fonts
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
           repository: storytold/craft-fonts
@@ -97,246 +129,239 @@ jobs:
           path: craft-fonts
           fetch-depth: 1
 
-      - name: Record source revisions
-        if: steps.release-check.outputs.skip != 'true'
+      - name: Record exact upstream and font revisions
+        if: steps.check.outputs.skip != 'true'
         id: source
         shell: bash
         run: |
+          set -euo pipefail
           echo "pdfcraft_sha=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "pdfcraft_short=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
           echo "craft_fonts_sha=$(git -C craft-fonts rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Record upstream release commit for image tags
-        if: steps.release-check.outputs.skip != 'true'
-        id: release-source
-        shell: bash
-        run: |
-          echo "short=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
-
+      # --------------------------------------------------
+      # 5. Install matching Rust and WebAssembly toolchain.
+      # --------------------------------------------------
       - name: Install Rust and WebAssembly target
-        if: steps.release-check.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
       - name: Cache Rust build artifacts
-        if: steps.release-check.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "upstream -> upstream/target"
 
       - name: Install Trunk
-        if: steps.release-check.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         shell: bash
         run: cargo install trunk --locked
 
-      - name: Install matching wasm-bindgen CLI
-        if: steps.release-check.outputs.skip != 'true'
-        shell: bash
-        run: |
-          WASM_BINDGEN_VERSION="$(python3 - <<'PY'
-          import tomllib
-          from pathlib import Path
-
-          lock = tomllib.loads(Path("upstream/Cargo.lock").read_text())
-          versions = {
-              pkg["version"]
-              for pkg in lock["package"]
-              if pkg["name"] == "wasm-bindgen"
-          }
-          if not versions:
-              raise SystemExit("No wasm-bindgen package found in upstream/Cargo.lock")
-
-          def version_key(version):
-              return tuple(int(part) for part in version.split("-")[0].split("."))
-
-          print(max(versions, key=version_key))
-          PY
-          )"
-          echo "Installing wasm-bindgen-cli ${WASM_BINDGEN_VERSION}"
-          cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}" --locked
-
-      - name: Build PdfCraft WebAssembly app
-        if: steps.release-check.outputs.skip != 'true'
-        shell: bash
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          export CRAFT_FONTS_DIR="${GITHUB_WORKSPACE}/craft-fonts"
-          cd upstream/apps/pdfcraft-web
-          trunk build --release
-
-      - name: Prepare Docker build context and NGINX configuration
-        if: steps.release-check.outputs.skip != 'true'
+      - name: Install upstream-compatible wasm-bindgen CLI
+        if: steps.check.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
+          WASM_BINDGEN_VERSION="$(python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+          lock = tomllib.loads(Path('upstream/Cargo.lock').read_text())
+          versions = {p['version'] for p in lock['package'] if p['name'] == 'wasm-bindgen'}
+          if not versions:
+              raise SystemExit('wasm-bindgen not found in upstream Cargo.lock')
+          print(max(versions, key=lambda v: tuple(int(x) for x in v.split('-')[0].split('.'))))
+          PY
+          )"
+          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
 
-          WEB_DIST="upstream/dist/web"
-          test -f "${WEB_DIST}/index.html"
-          test -n "$(find "${WEB_DIST}" -type f -name '*.wasm' -print -quit)"
-          test -n "$(find "${WEB_DIST}" -maxdepth 1 -type f -name '*.js' -print -quit)"
+      # --------------------------------------------------
+      # 6. Compile once (not once per Docker architecture).
+      # --------------------------------------------------
+      - name: Validate upstream web layout
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in Cargo.toml Cargo.lock apps/pdfcraft-web/Trunk.toml \
+                      apps/pdfcraft-web/index.html LICENSE-MIT LICENSE-APACHE \
+                      NOTICE ATTRIBUTION.md ATTRIBUTION.toml; do
+            test -s "upstream/$file" || { echo "::error::Missing upstream/$file"; exit 1; }
+          done
 
-          # Ensure the generated HTML keeps relative URLs, as required by upstream.
-          if grep -Eq '(src|href)="/[^/]' "${WEB_DIST}/index.html"; then
-            echo "::error::The generated site contains root-absolute URLs and may not work under a URL prefix."
+      - name: Compile official PdfCraft WebAssembly application
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        working-directory: upstream/apps/pdfcraft-web
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euo pipefail
+          trunk build --release
+
+      # --------------------------------------------------
+      # 7. Prepare static website and download OCR models.
+      #    Upstream requires cargo xtask models DEST; Trunk
+      #    alone does not populate the models/ directory.
+      # --------------------------------------------------
+      - name: Assemble website and versioned Docker configuration
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          WEB_DIST=upstream/dist/web
+          test -s "$WEB_DIST/index.html"
+          test -n "$(find "$WEB_DIST" -type f -name '*.wasm' -print -quit)"
+          test -n "$(find "$WEB_DIST" -maxdepth 1 -type f -name '*.js' -print -quit)"
+          if grep -Eq '(src|href)="/[^/]' "$WEB_DIST/index.html"; then
+            echo "::error::Absolute HTML asset URLs would break subpath hosting."
+            exit 1
+          fi
+          mkdir -p docker-build/dist/licenses
+          cp -a "$WEB_DIST/." docker-build/dist/
+          cp packaging/Dockerfile packaging/nginx.conf packaging/.dockerignore docker-build/
+          cp upstream/LICENSE-MIT upstream/LICENSE-APACHE upstream/NOTICE \
+             upstream/ATTRIBUTION.md upstream/ATTRIBUTION.toml docker-build/dist/licenses/
+          cp upstream/packaging/web/README.md docker-build/dist/licenses/UPSTREAM-HOSTING.md
+          # Preserve licences of every font checked out from craft-fonts.
+          for file in craft-fonts/fonts/*/OFL.txt; do
+            [ -f "$file" ] || continue
+            family="$(basename "$(dirname "$file")")"
+            cp "$file" "docker-build/dist/licenses/OFL-$family.txt"
+          done
+          test -s docker-build/dist/index.html
+
+      - name: Download and verify OCR model assets
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          # Upstream xtask verifies each model against ATTRIBUTION.toml (SHA-256)
+          # and writes matching attribution and licence information.
+          cargo xtask models "${GITHUB_WORKSPACE}/docker-build/dist/models"
+          test -s "${GITHUB_WORKSPACE}/docker-build/dist/models/ATTRIBUTION.txt"
+          test -n "$(find "${GITHUB_WORKSPACE}/docker-build/dist/models" -type f -name '*.onnx' -print -quit)"
+          if ! find "${GITHUB_WORKSPACE}/docker-build/dist/models" -type f -name '*.LICENCE.txt' | grep -q .; then
+            echo '::error::OCR model licence notices missing.'
             exit 1
           fi
 
-          mkdir -p docker-build/dist
-          cp -a "${WEB_DIST}/." docker-build/dist/
-
-          cat > docker-build/nginx.conf <<'NGINX'
-          server {
-              listen 8080;
-              listen [::]:8080;
-              server_name _;
-
-              root /usr/share/nginx/html;
-              index index.html;
-
-              # PdfCraft's site is static and may also be hosted under a URL prefix.
-              location / {
-                  try_files $uri $uri/ =404;
-              }
-
-              location = /index.html {
-                  default_type text/html;
-                  add_header Cache-Control "no-cache";
-              }
-
-              location ~* \.wasm$ {
-                  default_type application/wasm;
-                  add_header Cache-Control "public, max-age=31536000, immutable";
-              }
-
-              location ~* \.js$ {
-                  default_type text/javascript;
-                  add_header Cache-Control "public, max-age=31536000, immutable";
-              }
-
-              gzip on;
-              gzip_vary on;
-              gzip_min_length 1024;
-              gzip_types application/wasm text/javascript;
-          }
-          NGINX
-
-          cat > docker-build/Dockerfile <<'DOCKERFILE'
-          FROM nginx:alpine
-
-          ARG PDFCRAFT_COMMIT
-          ARG CRAFT_FONTS_COMMIT
-
-          LABEL org.opencontainers.image.title="PdfCraft Web"
-          LABEL org.opencontainers.image.description="Self-hosted browser build of PdfCraft"
-          LABEL org.opencontainers.image.source="https://github.com/storytold/pdfcraft"
-          LABEL org.opencontainers.image.revision="${PDFCRAFT_COMMIT}"
-          LABEL io.mikapst.pdfcraft.craft-fonts-revision="${CRAFT_FONTS_COMMIT}"
-
-          RUN rm -f /etc/nginx/conf.d/default.conf
-
-          COPY nginx.conf /etc/nginx/conf.d/default.conf
-          COPY dist/ /usr/share/nginx/html/
-
-          EXPOSE 8080
-          DOCKERFILE
-
-          test -f docker-build/Dockerfile
-          test -f docker-build/nginx.conf
-          test -f docker-build/dist/index.html
-          echo "Generated Docker build context:"
-          find docker-build -maxdepth 2 -type f | sort | head -60
+      # --------------------------------------------------
+      # 8. Set up Buildx/QEMU, authenticate and publish.
+      # --------------------------------------------------
+      - name: Set up QEMU
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        if: steps.release-check.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
-        if: steps.release-check.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate image metadata
-        if: steps.release-check.outputs.skip != 'true'
+      - name: Generate Docker image tags
+        if: steps.check.outputs.skip != 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/mikapst/pdfcraft-web
           tags: |
             type=raw,value=latest
-            type=raw,value=${{ steps.upstream-release.outputs.tag }}
+            type=raw,value=${{ steps.release.outputs.tag }}
             type=raw,value=upstream-${{ steps.source.outputs.pdfcraft_short }}
 
-      - name: Build and publish multi-platform image
-        if: steps.release-check.outputs.skip != 'true'
+      - name: Build and push multi-platform Docker image
+        if: steps.check.outputs.skip != 'true'
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ${{ github.workspace }}/docker-build
-          file: ${{ github.workspace }}/docker-build/Dockerfile
-          push: true
+          context: ./docker-build
+          file: ./docker-build/Dockerfile
           platforms: linux/amd64,linux/arm64
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
+            PDFCRAFT_VERSION=${{ steps.release.outputs.tag }}
             PDFCRAFT_COMMIT=${{ steps.source.outputs.pdfcraft_sha }}
             CRAFT_FONTS_COMMIT=${{ steps.source.outputs.craft_fonts_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Create or update versioned GitHub Release
-        if: steps.release-check.outputs.skip != 'true'
+      # --------------------------------------------------
+      # 9. Publish GitHub Release ONLY after GHCR push.
+      # --------------------------------------------------
+      - name: Create or update matching GitHub Release
+        if: steps.check.outputs.skip != 'true'
         uses: actions/github-script@v7
         env:
-          RELEASE_TAG: ${{ steps.upstream-release.outputs.tag }}
-          RELEASE_NAME: ${{ steps.upstream-release.outputs.name }}
-          RELEASE_URL: ${{ steps.upstream-release.outputs.url }}
-          RELEASE_NOTES: ${{ steps.upstream-release.outputs.body }}
-          RELEASE_PRERELEASE: ${{ steps.upstream-release.outputs.prerelease }}
-          RELEASE_PUBLISHED_AT: ${{ steps.upstream-release.outputs.published_at }}
-          RELEASE_SOURCE_SHA: ${{ steps.release-source.outputs.short }}
-          RELEASE_DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_NAME: ${{ steps.release.outputs.name }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          RELEASE_PRERELEASE: ${{ steps.release.outputs.prerelease }}
+          RELEASE_PUBLISHED_AT: ${{ steps.release.outputs.published_at }}
+          PDFCRAFT_SHA: ${{ steps.source.outputs.pdfcraft_sha }}
+          PDFCRAFT_SHORT: ${{ steps.source.outputs.pdfcraft_short }}
+          CRAFT_FONTS_SHA: ${{ steps.source.outputs.craft_fonts_sha }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         with:
           script: |
             const tag = process.env.RELEASE_TAG;
             const image = 'ghcr.io/mikapst/pdfcraft-web';
+            const { data: upstream } = await github.rest.repos.getReleaseByTag({
+              owner: 'storytold', repo: 'pdfcraft', tag
+            });
             const body = [
-              `Community-maintained Docker packaging for **${process.env.RELEASE_NAME}**.`,
+              `Independent Docker packaging for **${process.env.RELEASE_NAME}**.`,
               '',
               '## Docker image',
               `- \`${image}:latest\``,
               `- \`${image}:${tag}\``,
-              `- \`${image}:upstream-${process.env.RELEASE_SOURCE_SHA}\``,
+              `- \`${image}:upstream-${process.env.PDFCRAFT_SHORT}\``,
               '',
-              'Platforms: `linux/amd64`, `linux/arm64`.',
+              'Supported platforms: `linux/amd64`, `linux/arm64`.',
+              `Image digest: \`${process.env.IMAGE_DIGEST || 'not reported'}\``,
               '',
-              `Official upstream release: ${process.env.RELEASE_URL}`,
-              `Published upstream: ${process.env.RELEASE_PUBLISHED_AT || 'not specified'}`,
-              '',
-              `Upstream source commit: \`${process.env.RELEASE_SOURCE_SHA}\``,
-              `Docker manifest digest: \`${process.env.RELEASE_DIGEST || 'not reported'}\``,
+              '## Build sources',
+              `- **Official release:** ${process.env.RELEASE_URL}`,
+              `- **Upstream published:** ${process.env.RELEASE_PUBLISHED_AT || 'not specified'}`,
+              `- **PdfCraft commit:** \`${process.env.PDFCRAFT_SHA}\``,
+              `- **craft-fonts commit:** \`${process.env.CRAFT_FONTS_SHA}\``,
+              '- **OCR models:** downloaded and SHA-256-verified from upstream ATTRIBUTION.toml during CI',
               '',
               '## Upstream release notes',
-              process.env.RELEASE_NOTES || 'No release notes provided upstream.',
+              upstream.body || 'No release notes provided.',
               '',
-              'This is an independent Docker packaging release, not an official upstream distribution.'
+              'This is community-maintained Docker packaging; it is not an official PdfCraft or ArtCraft release.'
             ].join('\n');
             let existing;
             try {
-              existing = (await github.rest.repos.getReleaseByTag({ ...context.repo, tag })).data;
+              existing = (await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner, repo: context.repo.repo, tag
+              })).data;
             } catch (error) {
               if (error.status !== 404) throw error;
             }
+            const args = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `PdfCraft Web ${tag}`,
+              body,
+              draft: false,
+              prerelease: process.env.RELEASE_PRERELEASE === 'true'
+            };
             if (existing) {
-              await github.rest.repos.updateRelease({
-                ...context.repo, release_id: existing.id, name: 'PdfCraft Web ' + tag,
-                body, draft: false, prerelease: process.env.RELEASE_PRERELEASE === 'true'
-              });
+              await github.rest.repos.updateRelease({ ...args, release_id: existing.id });
             } else {
-              await github.rest.repos.createRelease({
-                ...context.repo, tag_name: tag, target_commitish: context.sha,
-                name: 'PdfCraft Web ' + tag, body, draft: false, prerelease: process.env.RELEASE_PRERELEASE === 'true'
-              });
+              await github.rest.repos.createRelease({ ...args, target_commitish: context.sha });
             }
